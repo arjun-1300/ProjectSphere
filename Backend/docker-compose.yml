@@ -1,0 +1,64 @@
+# ProjectSphere full local stack: API + PostgreSQL + pgAdmin.
+# Usage:
+#   cp .env.example .env   # fill in secrets (JWT, SMTP, Cloudinary, Gemini)
+#   docker compose up --build
+# API:      http://localhost:5000/api/v1
+# Docs:     http://localhost:5000/api/v1/docs
+# pgAdmin:  http://localhost:5050  (admin@projectsphere.dev / admin)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: projectsphere-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: projectsphere
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d projectsphere']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: projectsphere-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Override DB host to reach the postgres service on the compose network.
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/projectsphere?schema=public
+      PORT: 5000
+      NODE_ENV: production
+    ports:
+      - '5000:5000'
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: projectsphere-pgadmin
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@projectsphere.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - '5050:80'
+    volumes:
+      - pgadmin:/var/lib/pgadmin
+
+volumes:
+  pgdata:
+  pgadmin:

@@ -1,0 +1,550 @@
+// ProjectSphere — Prisma Schema
+// PostgreSQL. Full-text search enabled via `fullTextSearchPostgres` preview feature.
+// Design notes:
+//  - Soft deletes (deletedAt) on User, Project, Comment.
+//  - Every model carries createdAt/updatedAt.
+//  - Social join tables (Like, Bookmark, Follow) use composite unique constraints.
+//  - RefreshToken supports rotation + reuse detection via `familyId` + `revokedAt`.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearchPostgres"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================
+// ENUMS
+// =====================================================
+
+enum Role {
+  ADMIN
+  DEVELOPER
+  RECRUITER
+}
+
+enum AuthProvider {
+  LOCAL
+  GOOGLE
+  GITHUB
+}
+
+enum ProjectStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum ProjectDifficulty {
+  BEGINNER
+  INTERMEDIATE
+  ADVANCED
+}
+
+enum ProjectImageType {
+  COVER
+  GALLERY
+  ARCHITECTURE
+}
+
+enum NotificationType {
+  LIKE
+  COMMENT
+  REPLY
+  FOLLOW
+  FEATURED
+  ADMIN_MESSAGE
+}
+
+enum ReportType {
+  SPAM
+  FAKE
+  ABUSE
+  COPYRIGHT
+  INAPPROPRIATE
+}
+
+enum ReportStatus {
+  PENDING
+  REVIEWED
+  RESOLVED
+  DISMISSED
+}
+
+enum ReportTargetType {
+  PROJECT
+  COMMENT
+}
+
+enum AnalyticsEventType {
+  PROJECT_VIEW
+  DEMO_CLICK
+  GITHUB_CLICK
+  PROFILE_VIEW
+}
+
+// =====================================================
+// USER & AUTH
+// =====================================================
+
+model User {
+  id                String        @id @default(cuid())
+  email             String        @unique
+  username          String        @unique
+  passwordHash      String? // null for OAuth-only accounts
+  role              Role          @default(DEVELOPER)
+  authProvider      AuthProvider  @default(LOCAL)
+  googleId          String?       @unique
+  githubId          String?       @unique
+  isEmailVerified   Boolean       @default(false)
+  isBanned          Boolean       @default(false)
+
+  // Per-type email notification toggles, e.g. { "LIKE": true, "FOLLOW": false }.
+  // Absent keys default to enabled. JSON keeps this flexible without a table.
+  notificationPrefs Json?
+
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  deletedAt         DateTime? // soft delete
+
+  // Relations
+  profile           Profile?
+  projects          Project[]
+  comments          Comment[]
+  likes             Like[]
+  bookmarks         Bookmark[]
+  refreshTokens     RefreshToken[]
+  emailTokens       EmailToken[]
+  notifications     Notification[] @relation("NotificationRecipient")
+  actorNotifications Notification[] @relation("NotificationActor")
+  reportsMade       Report[]      @relation("Reporter")
+  analyticsEvents   AnalyticsEvent[]
+  searchQueries     SearchQuery[]
+  adminAuditLogs    AdminAuditLog[] @relation("AdminAudit")
+
+  // Follow graph
+  following         Follow[]      @relation("Follower")
+  followers         Follow[]      @relation("Following")
+
+  @@index([role])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+model Profile {
+  id                    String    @id @default(cuid())
+  userId                String    @unique
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name                  String?
+  headline              String?
+  bio                   String?   @db.Text
+  location              String?
+  skills                String[]  @default([])
+  experience            String?   @db.Text
+  education             String?   @db.Text
+
+  avatarUrl             String?
+  avatarPublicId        String? // Cloudinary public_id for deletion
+  coverImageUrl         String?
+  coverImagePublicId    String?
+  resumeUrl             String?
+  resumePublicId        String?
+
+  portfolioWebsite      String?
+  githubUrl             String?
+  linkedinUrl           String?
+  twitterUrl            String?
+
+  openToWork            Boolean   @default(false)
+  profileViews          Int       @default(0)
+  completionPercentage  Int       @default(0)
+
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@map("profiles")
+}
+
+// Refresh token with rotation + reuse detection.
+// A "family" is a chain of rotated tokens from one login.
+// If a revoked token is presented, we revoke the whole family (theft signal).
+model RefreshToken {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tokenHash   String    @unique // sha256 of the raw token — never store raw
+  familyId    String // shared across a rotation chain
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  replacedBy  String? // id of the token that replaced this one on rotation
+
+  userAgent   String?
+  ipAddress   String?
+
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+// Email verification + password reset tokens (single table, typed).
+model EmailToken {
+  id          String        @id @default(cuid())
+  userId      String
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tokenHash   String        @unique
+  type        EmailTokenType
+  expiresAt   DateTime
+  consumedAt  DateTime?
+
+  createdAt   DateTime      @default(now())
+
+  @@index([userId])
+  @@map("email_tokens")
+}
+
+enum EmailTokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+// =====================================================
+// PROJECTS
+// =====================================================
+
+model Project {
+  id                    String            @id @default(cuid())
+  authorId              String
+  author                User              @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  title                 String
+  slug                  String            @unique
+  shortDescription      String
+  detailedDescription   String?           @db.Text
+
+  demoVideoUrl          String?
+  liveUrl               String?
+  githubUrl             String?
+
+  problemStatement      String?           @db.Text
+  solution              String?           @db.Text
+  challenges            String?           @db.Text
+  futureScope           String?           @db.Text
+  installationGuide     String?           @db.Text
+
+  difficulty            ProjectDifficulty @default(INTERMEDIATE)
+  status                ProjectStatus     @default(DRAFT)
+  isFeatured            Boolean           @default(false)
+  isOpenSource          Boolean           @default(false)
+  // Moderation: hidden auto-flags when it accumulates unresolved reports.
+  isHidden              Boolean           @default(false)
+  moderatedAt           DateTime?
+  license               String?
+  version               String?
+  estimatedDevTime      String?
+
+  // Denormalized counters (kept in sync in service layer for read performance)
+  viewCount             Int               @default(0)
+  likeCount             Int               @default(0)
+  bookmarkCount         Int               @default(0)
+  commentCount          Int               @default(0)
+
+  categoryId            String?
+  category              Category?         @relation(fields: [categoryId], references: [id])
+
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  publishedAt           DateTime?
+  deletedAt             DateTime? // soft delete
+
+  images                ProjectImage[]
+  technologies          ProjectTechnology[]
+  tags                  ProjectTag[]
+  likes                 Like[]
+  bookmarks             Bookmark[]
+  comments              Comment[]
+
+  @@index([authorId])
+  @@index([status])
+  @@index([categoryId])
+  @@index([isFeatured])
+  @@index([isHidden])
+  @@index([deletedAt])
+  // Composite index supporting "published, newest first" discovery queries
+  @@index([status, publishedAt])
+  @@map("projects")
+}
+
+model ProjectImage {
+  id          String            @id @default(cuid())
+  projectId   String
+  project     Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  url         String
+  publicId    String // Cloudinary public_id
+  type        ProjectImageType  @default(GALLERY)
+  position    Int               @default(0) // ordering within gallery
+  caption     String?
+
+  createdAt   DateTime          @default(now())
+
+  @@index([projectId])
+  @@map("project_images")
+}
+
+model Category {
+  id          String    @id @default(cuid())
+  name        String    @unique
+  slug        String    @unique
+  description String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  projects    Project[]
+
+  @@map("categories")
+}
+
+// Technologies are the tech stack (React, Spring Boot, PostgreSQL...).
+model Technology {
+  id          String              @id @default(cuid())
+  name        String              @unique
+  slug        String              @unique
+  iconUrl     String?
+
+  createdAt   DateTime            @default(now())
+
+  projects    ProjectTechnology[]
+
+  @@map("technologies")
+}
+
+model ProjectTechnology {
+  projectId     String
+  project       Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  technologyId  String
+  technology    Technology  @relation(fields: [technologyId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, technologyId])
+  @@index([technologyId])
+  @@map("project_technologies")
+}
+
+// Free-form tags (distinct from curated technologies).
+model Tag {
+  id        String        @id @default(cuid())
+  name      String        @unique
+  slug      String        @unique
+
+  createdAt DateTime      @default(now())
+
+  projects  ProjectTag[]
+
+  @@map("tags")
+}
+
+model ProjectTag {
+  projectId String
+  project   Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tagId     String
+  tag       Tag       @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, tagId])
+  @@index([tagId])
+  @@map("project_tags")
+}
+
+// =====================================================
+// SOCIAL
+// =====================================================
+
+model Like {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, projectId]) // one like per user per project
+  @@index([projectId])
+  @@map("likes")
+}
+
+model Bookmark {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, projectId])
+  @@index([projectId])
+  @@map("bookmarks")
+}
+
+model Follow {
+  id            String   @id @default(cuid())
+  followerId    String
+  follower      User     @relation("Follower", fields: [followerId], references: [id], onDelete: Cascade)
+  followingId   String
+  following     User     @relation("Following", fields: [followingId], references: [id], onDelete: Cascade)
+
+  createdAt     DateTime @default(now())
+
+  @@unique([followerId, followingId]) // can't follow the same person twice
+  @@index([followingId])
+  @@map("follows")
+}
+
+model Comment {
+  id          String    @id @default(cuid())
+  projectId   String
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  authorId    String
+  author      User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  content     String    @db.Text
+  // Self-relation for single-level replies. parentId null => top-level comment.
+  parentId    String?
+  parent      Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies     Comment[] @relation("CommentReplies")
+
+  mentionedUserIds String[] @default([])
+  editedAt    DateTime?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime? // soft delete
+
+  @@index([projectId])
+  @@index([authorId])
+  @@index([parentId])
+  @@map("comments")
+}
+
+// =====================================================
+// NOTIFICATIONS
+// =====================================================
+
+model Notification {
+  id          String            @id @default(cuid())
+  recipientId String
+  recipient   User              @relation("NotificationRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  actorId     String?
+  actor       User?             @relation("NotificationActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  type        NotificationType
+  message     String
+  // Loose reference to the entity involved (project slug, comment id, etc.)
+  entityType  String?
+  entityId    String?
+  link        String?
+
+  isRead      Boolean           @default(false)
+  readAt      DateTime?
+
+  createdAt   DateTime          @default(now())
+
+  @@index([recipientId, isRead])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+// =====================================================
+// REPORTS & MODERATION
+// =====================================================
+
+model Report {
+  id            String            @id @default(cuid())
+  reporterId    String
+  reporter      User              @relation("Reporter", fields: [reporterId], references: [id], onDelete: Cascade)
+
+  targetType    ReportTargetType
+  targetId      String // project id or comment id
+  reason        ReportType
+  details       String?           @db.Text
+
+  status        ReportStatus      @default(PENDING)
+  adminNotes    String?           @db.Text
+  reviewedAt    DateTime?
+
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@unique([reporterId, targetType, targetId]) // one report per user per target
+  @@index([status])
+  @@index([targetType, targetId])
+  @@map("reports")
+}
+
+// =====================================================
+// ANALYTICS
+// =====================================================
+
+model AnalyticsEvent {
+  id          String              @id @default(cuid())
+  type        AnalyticsEventType
+  projectId   String? // null for profile-level events
+  userId      String? // null for anonymous visitors
+  user        User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  visitorHash String? // hashed IP+UA for unique-visitor dedup without storing PII
+  metadata    Json?
+
+  createdAt   DateTime            @default(now())
+
+  @@index([projectId, type])
+  @@index([type, createdAt])
+  @@map("analytics_events")
+}
+
+// =====================================================
+// SEARCH HISTORY
+// =====================================================
+
+// Records search terms for "recent searches" (per user) and "popular searches"
+// (global aggregation). Anonymous searches are stored with a null userId.
+model SearchQuery {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  query     String
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([query])
+  @@map("search_queries")
+}
+
+// =====================================================
+// ADMIN AUDIT LOG
+// =====================================================
+
+// Immutable record of privileged admin actions (ban, feature, resolve report…)
+// for accountability. Written from the admin service, never updated or deleted.
+model AdminAuditLog {
+  id         String   @id @default(cuid())
+  adminId    String
+  admin      User     @relation("AdminAudit", fields: [adminId], references: [id], onDelete: Cascade)
+  action     String // e.g. USER_BAN, USER_ROLE_CHANGE, PROJECT_FEATURE, REPORT_RESOLVE
+  targetType String? // user | project | comment | report | category | technology
+  targetId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([adminId, createdAt])
+  @@index([action])
+  @@map("admin_audit_logs")
+}
